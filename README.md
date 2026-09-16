@@ -1,3 +1,5 @@
+> **Stable Custom 分支：** 本仓库是面向 Codex 托管认证、共享历史、外接模型目录和 Linux/Clash 生命周期的定制稳定版。请先阅读 [定制说明](README_CUSTOM.md)、[工作清单](工作清单.md) 和 [验收清单](验收清单.md)。原项目说明保留如下。
+
 <div align="center">
 
 # CC Switch
