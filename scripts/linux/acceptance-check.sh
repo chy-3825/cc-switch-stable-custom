@@ -95,14 +95,143 @@ case "$proxy_mode" in
   *) warn "unrecognized GNOME proxy mode: $proxy_mode" ;;
 esac
 
-if rg -q '^# cc-switch-managed-official-proxy-v2$' "$codex_config" \
-  && rg -q '^model_provider[[:space:]]*=[[:space:]]*"custom"' "$codex_config" \
-  && rg -q '^requires_openai_auth[[:space:]]*=[[:space:]]*false' "$codex_config" \
-  && rg -q '^base_url[[:space:]]*=[[:space:]]*"http://127\.0\.0\.1:15721/v1"' "$codex_config" \
-  && rg -q '^experimental_bearer_token[[:space:]]*=[[:space:]]*"PROXY_MANAGED"' "$codex_config"; then
-  pass "Codex live route is CC-managed and cannot consume auth.json"
+# The live config shape depends on which card is current:
+# - official managed: marker + name=OpenAI, no raw credential in config.toml;
+# - third-party takeover: no marker, loopback route + PROXY_MANAGED placeholder.
+# Both must route to the local proxy and must never carry a real secret.
+if python3 - "$codex_config" "$db_path" <<'PY'
+import json, re, sqlite3, sys
+from pathlib import Path
+
+config_path, db_path = sys.argv[1], sys.argv[2]
+text = Path(config_path).read_text(encoding="utf-8")
+marker = any(line.strip() == "# cc-switch-managed-official-proxy-v2" for line in text.splitlines())
+problems = []
+
+def parse_toml(raw):
+    try:
+        import tomllib as parser  # Python 3.11+
+    except ModuleNotFoundError:
+        try:
+            import tomli as parser  # optional backport
+        except ModuleNotFoundError:
+            parser = None
+    if parser is not None:
+        return parser.loads(raw), None
+    # Python 3.10 fallback: only the scalar fields this check needs.
+    scalars = {}
+    section = ""
+    tables = {}
+    for line in raw.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        header = re.fullmatch(r"\[([^\]]+)\]", stripped)
+        if header:
+            section = header.group(1).strip()
+            tables.setdefault(section, {})
+            continue
+        assign = re.fullmatch(r'([A-Za-z0-9_.\-]+)\s*=\s*(.+)', stripped)
+        if not assign:
+            continue
+        key, value = assign.group(1), assign.group(2).strip()
+        if value.startswith('"') and value.endswith('"'):
+            parsed = value[1:-1]
+        elif value in ("true", "false"):
+            parsed = value == "true"
+        else:
+            parsed = value
+        if section:
+            tables.setdefault(section, {})[key] = parsed
+        else:
+            scalars[key] = parsed
+    doc_fallback = dict(scalars)
+    for table_name, values in tables.items():
+        parts = table_name.split(".")
+        node = doc_fallback
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                node = {}
+        if isinstance(node, dict):
+            node.setdefault(parts[-1], {}).update(values)
+    return doc_fallback, "builtin-fallback"
+
+try:
+    doc, fallback = parse_toml(text)
+except Exception as exc:
+    print(f"config.toml is not valid TOML: {exc}")
+    raise SystemExit(1)
+
+provider_id = doc.get("model_provider")
+if provider_id != "custom":
+    problems.append(f"model_provider={provider_id!r} (expected 'custom')")
+providers = doc.get("model_providers")
+table = providers.get(provider_id) if isinstance(providers, dict) and isinstance(provider_id, str) else None
+if not isinstance(table, dict):
+    problems.append("active [model_providers.<id>] table missing or malformed")
+    table = {}
+
+loopback = re.fullmatch(r"http://(127\.0\.0\.1|localhost|\[::1\]):(\d+)/v1/?", str(table.get("base_url") or ""))
+if not loopback or loopback.group(2) != "15721":
+    problems.append(f"base_url is not the local CC Switch route: {table.get('base_url')!r}")
+if table.get("wire_api") != "responses":
+    problems.append(f"wire_api={table.get('wire_api')!r} (expected 'responses')")
+
+bearer = table.get("experimental_bearer_token")
+auth_flag = table.get("requires_openai_auth")
+
+if marker:
+    shape = "official"
+    if table.get("name") != "OpenAI":
+        problems.append(f"official route name={table.get('name')!r} (expected 'OpenAI')")
+    if auth_flag is True:
+        # Native/OAuth passthrough projection: Codex authenticates itself, so no
+        # proxy placeholder may sit in the table.
+        if bearer is not None:
+            problems.append("official passthrough route carries a bearer token")
+    elif auth_flag is False:
+        # Managed route: the proxy owns OAuth, so the placeholder is mandatory
+        # and must be the only credential in the table.
+        if bearer != "PROXY_MANAGED":
+            problems.append(f"managed official route bearer={bearer!r} (expected 'PROXY_MANAGED')")
+    else:
+        problems.append(f"official route requires_openai_auth={auth_flag!r}")
+else:
+    shape = "third-party"
+    if bearer != "PROXY_MANAGED":
+        problems.append(f"third-party route bearer={bearer!r} (expected the 'PROXY_MANAGED' placeholder)")
+
+# A live config must never hold a real credential: only the placeholder is allowed.
+for raw in re.findall(r'^\s*experimental_bearer_token\s*=\s*"([^"]*)"', text, re.M):
+    if raw != "PROXY_MANAGED":
+        problems.append("config.toml embeds a non-placeholder bearer token")
+
+# Cross-check the route kind against the database's current card.
+con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+row = con.execute(
+    "select name, settings_config, meta from providers where app_type='codex' and is_current=1"
+).fetchone()
+if row is None:
+    problems.append("database has no current Codex card")
+else:
+    name, _settings_raw, meta_raw = row
+    meta = json.loads(meta_raw or "{}")
+    binding = meta.get("authBinding") or meta.get("auth_binding") or {}
+    card_is_official = binding.get("source") == "managed_account"
+    expected = "official" if card_is_official else "third-party"
+    if shape != expected:
+        problems.append(f"live route shape {shape!r} does not match current card {name!r} (expected {expected!r})")
+
+print(f"shape={shape} marker={marker} requires_openai_auth={auth_flag} bearer={'placeholder' if bearer else 'none'}")
+for problem in problems:
+    print(f"  - {problem}")
+raise SystemExit(1 if problems else 0)
+PY
+then
+  pass "Codex live route matches the current card and carries no raw credential"
 else
-  fail "Codex live route is not the complete managed placeholder shape"
+  fail "Codex live route does not match the current card's expected shape"
 fi
 
 if jq -e '.preserveCodexOfficialAuthOnSwitch == true and .unifyCodexSessionHistory == true and .unifyCodexMigrateExisting == true' "$settings_path" >/dev/null; then
