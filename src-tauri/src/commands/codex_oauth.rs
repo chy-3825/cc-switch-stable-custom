@@ -5,7 +5,7 @@
 //! 大部分认证命令通过通用 `auth_*` 命令（参见 `commands::auth`）暴露给前端，
 //! 此处定义 State wrapper 以及 Codex OAuth 专属的订阅额度和模型列表查询命令。
 
-use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
+use crate::proxy::providers::codex_oauth_auth::{CodexOAuthError, CodexOAuthManager};
 use crate::services::model_fetch::FetchedModel;
 use crate::services::subscription::{query_codex_quota, CredentialStatus, SubscriptionQuota};
 use std::sync::Arc;
@@ -60,13 +60,7 @@ async fn query_codex_oauth_quota_for(
     // 获取（必要时自动刷新）access_token
     let token = match manager.get_valid_token_for_account(id).await {
         Ok(t) => t,
-        Err(e) => {
-            return Ok(SubscriptionQuota::error(
-                "codex_oauth",
-                CredentialStatus::Expired,
-                format!("Codex OAuth token unavailable: {e}"),
-            ));
-        }
+        Err(e) => return classify_codex_oauth_token_error(e),
     };
     let chatgpt_account_id = manager
         .chatgpt_account_id_for_account(id)
@@ -81,6 +75,57 @@ async fn query_codex_oauth_quota_for(
         "Codex OAuth access token expired or rejected. Please re-login via cc-switch.",
     )
     .await
+}
+
+/// 将 token 获取失败映射为订阅查询结果。
+///
+/// 只有刷新接口明确返回 refresh_token_expired/reused/invalidated 时，
+/// 才能证明账号认证失效并显示“会话已过期”。网络、IO、普通 HTTP、解析
+/// 和账号状态错误都不能证明会话已失效；返回 Err 让前端按“查询失败”处理，
+/// 同时保留上一份成功的额度快照。
+fn classify_codex_oauth_token_error(error: CodexOAuthError) -> Result<SubscriptionQuota, String> {
+    match error {
+        CodexOAuthError::RefreshTokenInvalid => Ok(SubscriptionQuota::error(
+            "codex_oauth",
+            CredentialStatus::Expired,
+            "Codex OAuth refresh token explicitly rejected or expired; please re-login via cc-switch"
+                .to_string(),
+        )),
+        CodexOAuthError::AccountNotFound(_) => Ok(SubscriptionQuota::not_found("codex_oauth")),
+        CodexOAuthError::ParseError(message) => Ok(SubscriptionQuota::error(
+            "codex_oauth",
+            CredentialStatus::ParseError,
+            format!("Codex OAuth credential parse failed: {message}"),
+        )),
+        other => Err(format!("Codex OAuth token temporarily unavailable: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_codex_oauth_token_error;
+    use crate::proxy::providers::codex_oauth_auth::CodexOAuthError;
+    use crate::services::subscription::CredentialStatus;
+
+    #[test]
+    fn only_explicit_refresh_token_failure_is_expired() {
+        let result = classify_codex_oauth_token_error(CodexOAuthError::RefreshTokenInvalid);
+        assert!(matches!(
+            result,
+            Ok(quota) if matches!(quota.credential_status, CredentialStatus::Expired)
+        ));
+    }
+
+    #[test]
+    fn network_and_server_failures_are_query_failures() {
+        for error in [
+            CodexOAuthError::NetworkError("timeout".to_string()),
+            CodexOAuthError::TokenFetchFailed("HTTP 403".to_string()),
+            CodexOAuthError::IoError("read failed".to_string()),
+        ] {
+            assert!(classify_codex_oauth_token_error(error).is_err());
+        }
+    }
 }
 
 /// 获取 Codex OAuth (ChatGPT Plus/Pro) 可用模型列表

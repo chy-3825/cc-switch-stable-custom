@@ -1,6 +1,6 @@
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
-use crate::provider::{Provider, ProviderMeta};
+use crate::provider::{AuthBindingSource, Provider, ProviderMeta};
 use indexmap::IndexMap;
 use rusqlite::{params, OptionalExtension};
 use std::collections::{HashMap, HashSet};
@@ -15,6 +15,31 @@ type OmoProviderRow = (
     Option<String>,
     String,
 );
+
+/// Managed Codex OAuth credentials have a single source of truth: the OAuth
+/// account store. Provider rows keep only the account binding.  Enforce that
+/// boundary in the DAO so backfill, import, rollback, and future call sites
+/// cannot accidentally persist a live `auth.json` token bundle in a card.
+fn provider_settings_config_for_storage(app_type: &str, provider: &Provider) -> serde_json::Value {
+    let mut settings = provider.settings_config.clone();
+    let uses_managed_codex_auth = app_type == "codex"
+        && provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.auth_binding.as_ref())
+            .is_some_and(|binding| {
+                binding.source == AuthBindingSource::ManagedAccount
+                    && binding.auth_provider.as_deref() == Some("codex_oauth")
+            });
+
+    if uses_managed_codex_auth {
+        if let Some(settings) = settings.as_object_mut() {
+            settings.insert("auth".to_string(), serde_json::json!({}));
+        }
+    }
+
+    settings
+}
 
 impl Database {
     pub fn get_all_providers(
@@ -178,6 +203,9 @@ impl Database {
     }
 
     pub fn save_provider(&self, app_type: &str, provider: &Provider) -> Result<(), AppError> {
+        let settings_config = provider_settings_config_for_storage(app_type, provider);
+        let settings_config_json = serde_json::to_string(&settings_config)
+            .map_err(|e| AppError::Database(format!("Failed to serialize settings_config: {e}")))?;
         let mut conn = lock_conn!(self.conn);
         let tx = conn
             .transaction()
@@ -216,9 +244,7 @@ impl Database {
                 WHERE id = ?13 AND app_type = ?14",
                 params![
                     provider.name,
-                    serde_json::to_string(&provider.settings_config).map_err(|e| {
-                        AppError::Database(format!("Failed to serialize settings_config: {e}"))
-                    })?,
+                    settings_config_json,
                     provider.website_url,
                     provider.category,
                     provider.created_at,
@@ -246,8 +272,7 @@ impl Database {
                     provider.id,
                     app_type,
                     provider.name,
-                    serde_json::to_string(&provider.settings_config)
-                        .map_err(|e| AppError::Database(format!("Failed to serialize settings_config: {e}")))?,
+                    settings_config_json,
                     provider.website_url,
                     provider.category,
                     provider.created_at,
@@ -277,6 +302,26 @@ impl Database {
         Ok(())
     }
 
+    /// Remove OAuth token snapshots left in managed Codex provider rows by
+    /// older builds. The operation is idempotent and deliberately leaves
+    /// unbound/native-login cards untouched.
+    pub fn scrub_managed_codex_provider_auth_snapshots(&self) -> Result<usize, AppError> {
+        let providers = self.get_all_providers("codex")?;
+        let mut scrubbed = 0;
+
+        for mut provider in providers.into_values() {
+            let sanitized = provider_settings_config_for_storage("codex", &provider);
+            if sanitized == provider.settings_config {
+                continue;
+            }
+            provider.settings_config = sanitized;
+            self.save_provider("codex", &provider)?;
+            scrubbed += 1;
+        }
+
+        Ok(scrubbed)
+    }
+
     /// Replace a provider row under a new ID without exposing an intermediate
     /// duplicate or missing row. Existing endpoint and health references move
     /// with the provider, while its current-state bit is preserved.
@@ -290,6 +335,9 @@ impl Database {
             return self.save_provider(app_type, provider);
         }
 
+        let settings_config = provider_settings_config_for_storage(app_type, provider);
+        let settings_config_json = serde_json::to_string(&settings_config)
+            .map_err(|e| AppError::Database(format!("Failed to serialize settings_config: {e}")))?;
         let mut conn = lock_conn!(self.conn);
         let tx = conn
             .transaction()
@@ -337,9 +385,7 @@ impl Database {
                 provider.id,
                 app_type,
                 provider.name,
-                serde_json::to_string(&provider.settings_config).map_err(|e| {
-                    AppError::Database(format!("Failed to serialize settings_config: {e}"))
-                })?,
+                settings_config_json,
                 provider.website_url,
                 provider.category,
                 provider.created_at,
@@ -813,6 +859,118 @@ mod ensure_official_seed_tests {
         Database, CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, CODEX_OFFICIAL_PROVIDER_ID,
         GROKBUILD_OFFICIAL_PROVIDER_ID,
     };
+    use crate::provider::{AuthBinding, AuthBindingSource, Provider, ProviderMeta};
+    use rusqlite::params;
+    use serde_json::json;
+
+    fn managed_codex_provider(id: &str) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            "Managed Codex".to_string(),
+            json!({
+                "auth": {
+                    "tokens": {
+                        "access_token": "access-secret",
+                        "refresh_token": "refresh-secret"
+                    },
+                    "last_refresh": "2026-09-15T00:00:00Z"
+                },
+                "config": "model = \"gpt-5.6-luna\""
+            }),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        provider.meta = Some(ProviderMeta {
+            auth_binding: Some(AuthBinding {
+                source: AuthBindingSource::ManagedAccount,
+                auth_provider: Some("codex_oauth".to_string()),
+                account_id: Some("account-local-1".to_string()),
+            }),
+            ..ProviderMeta::default()
+        });
+        provider
+    }
+
+    #[test]
+    fn managed_codex_provider_never_persists_live_oauth_snapshot() {
+        let db = Database::memory().expect("memory db");
+        let provider = managed_codex_provider("managed-codex");
+
+        db.save_provider(AppType::Codex.as_str(), &provider)
+            .expect("save provider");
+
+        let stored = db
+            .get_provider_by_id("managed-codex", AppType::Codex.as_str())
+            .expect("query")
+            .expect("stored provider");
+        assert_eq!(stored.settings_config["auth"], json!({}));
+        assert_eq!(
+            stored.settings_config["config"],
+            json!("model = \"gpt-5.6-luna\"")
+        );
+        // DAO sanitizing must not mutate the caller's in-memory live snapshot.
+        assert_eq!(
+            provider.settings_config["auth"]["tokens"]["refresh_token"],
+            json!("refresh-secret")
+        );
+    }
+
+    #[test]
+    fn startup_scrub_removes_legacy_managed_snapshot_but_keeps_native_login_card() {
+        let db = Database::memory().expect("memory db");
+
+        // Seed the legacy shape through an unbound save, then attach the old
+        // managed binding directly as if it came from an earlier database.
+        let mut legacy = managed_codex_provider("legacy-managed");
+        legacy.meta = Some(ProviderMeta::default());
+        db.save_provider(AppType::Codex.as_str(), &legacy)
+            .expect("seed legacy settings");
+        let managed_meta = managed_codex_provider("ignored")
+            .meta
+            .expect("managed meta");
+        {
+            let conn = db.conn.lock().expect("db lock");
+            conn.execute(
+                "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = 'codex'",
+                params![
+                    serde_json::to_string(&managed_meta).expect("serialize meta"),
+                    "legacy-managed"
+                ],
+            )
+            .expect("attach legacy binding");
+        }
+
+        let mut native = legacy.clone();
+        native.id = "native-login".to_string();
+        native.name = "Native login".to_string();
+        db.save_provider(AppType::Codex.as_str(), &native)
+            .expect("save native card");
+
+        assert_eq!(
+            db.scrub_managed_codex_provider_auth_snapshots()
+                .expect("scrub"),
+            1
+        );
+        assert_eq!(
+            db.get_provider_by_id("legacy-managed", "codex")
+                .expect("query")
+                .expect("managed")
+                .settings_config["auth"],
+            json!({})
+        );
+        assert_eq!(
+            db.get_provider_by_id("native-login", "codex")
+                .expect("query")
+                .expect("native")
+                .settings_config["auth"]["tokens"]["refresh_token"],
+            json!("refresh-secret")
+        );
+        assert_eq!(
+            db.scrub_managed_codex_provider_auth_snapshots()
+                .expect("idempotent scrub"),
+            0
+        );
+    }
 
     #[test]
     fn ensure_inserts_when_missing() {

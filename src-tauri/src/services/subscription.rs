@@ -770,7 +770,10 @@ pub(crate) async fn query_codex_quota(
 
     let status = resp.status();
 
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+    // A 401 from the quota endpoint is an explicit access-token rejection.
+    // Do not treat 403 as expired: proxies/WAFs and upstream policy layers
+    // can reject the request without invalidating the OAuth credential.
+    if status == reqwest::StatusCode::UNAUTHORIZED {
         return Ok(SubscriptionQuota::error(
             tool_label,
             CredentialStatus::Expired,
@@ -780,11 +783,7 @@ pub(crate) async fn query_codex_quota(
 
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Ok(SubscriptionQuota::error(
-            tool_label,
-            CredentialStatus::Valid,
-            format!("API error (HTTP {status}): {body}"),
-        ));
+        return Err(format!("Quota query failed (HTTP {status}): {body}"));
     }
 
     let raw = match resp.bytes().await {
@@ -794,11 +793,7 @@ pub(crate) async fn query_codex_quota(
     let body: CodexUsageResponse = match serde_json::from_slice(&raw) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(SubscriptionQuota::error(
-                tool_label,
-                CredentialStatus::Valid,
-                format!("Failed to parse API response: {e}"),
-            ));
+            return Err(format!("Failed to parse API response: {e}"));
         }
     };
 

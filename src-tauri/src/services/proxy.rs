@@ -2586,14 +2586,16 @@ impl ProxyService {
         }
 
         if let Some(cfg_str) = config.get("config").and_then(|v| v.as_str()) {
-            let updated = Self::remove_local_toml_base_url(cfg_str);
+            // Recognize and remove the complete owned route before generic
+            // field cleanup destroys the marker's exact-shape evidence.
+            let updated = crate::codex_config::remove_codex_official_proxy_route(cfg_str)
+                .map_err(|e| format!("清理 Codex 官方接管路由失败: {e}"))?;
+            let updated = Self::remove_local_toml_base_url(&updated);
             let updated =
                 crate::codex_config::remove_codex_experimental_bearer_token_if(&updated, |token| {
                     token == PROXY_TOKEN_PLACEHOLDER
                 })
                 .map_err(|e| format!("清理 Codex 接管占位符失败: {e}"))?;
-            let updated = crate::codex_config::remove_codex_official_proxy_route(&updated)
-                .map_err(|e| format!("清理 Codex 官方接管路由失败: {e}"))?;
             config["config"] = json!(updated);
         }
 
@@ -3429,7 +3431,12 @@ impl ProxyService {
         proxy_url: &str,
         provider: Option<&Provider>,
     ) -> Result<String, String> {
-        if provider.is_some_and(crate::proxy::providers::is_codex_official_provider) {
+        // Every official card must use the shared history bucket while the
+        // proxy is active. Managed official cards authenticate through the
+        // proxy placeholder later, while unbound cards use native auth, but
+        // that credential distinction must not change the session bucket.
+        let is_official = provider.is_some_and(crate::proxy::providers::is_codex_official_provider);
+        if is_official {
             return crate::codex_config::apply_codex_official_proxy_route(toml_str, proxy_url)
                 .map_err(|e| format!("生成 Codex 官方接管配置失败: {e}"));
         }
@@ -3452,7 +3459,15 @@ impl ProxyService {
     }
 
     fn apply_codex_takeover_auth_placeholder(settings: &mut Value, provider: Option<&Provider>) {
-        if provider.is_some_and(crate::proxy::providers::is_codex_official_provider) {
+        let unbound_official = provider.is_some_and(|provider| {
+            crate::proxy::providers::is_codex_official_provider(provider)
+                && provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+                    .is_none()
+        });
+        if unbound_official {
             return;
         }
 
@@ -3658,13 +3673,13 @@ impl ProxyService {
         config: &Value,
         provider: Option<&Provider>,
     ) -> Result<(), String> {
-        let official_passthrough =
-            provider.is_some_and(crate::proxy::providers::is_codex_official_provider);
+        let is_official = provider.is_some_and(crate::proxy::providers::is_codex_official_provider);
         let managed_account_id = provider
             .and_then(|provider| provider.meta.as_ref())
             .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
             .filter(|account_id| !account_id.trim().is_empty());
-        let managed_official = official_passthrough && managed_account_id.is_some();
+        let managed_official = is_official && managed_account_id.is_some();
+        let official_passthrough = is_official && !managed_official;
         let placeholder_auth = config
             .get("auth")
             .is_some_and(Self::codex_auth_has_proxy_placeholder);
@@ -3683,27 +3698,13 @@ impl ProxyService {
                     config, config_str, profile,
                 )
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
-            if managed_official {
-                let auth = config
-                    .get("auth")
-                    .ok_or_else(|| "Codex 托管官方配置缺少 auth 字段".to_string())?;
-                // An explicitly managed official account is different from the
-                // unbound native-login passthrough: the selected account owns
-                // auth.json and must replace any previously active account.
-                crate::codex_config::write_codex_live_for_provider(
-                    Some("official"),
-                    auth,
-                    Some(&prepared_config),
-                )
-                .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
-                crate::codex_config::record_codex_managed_oauth_live_auth(
-                    auth,
-                    managed_account_id
-                        .as_deref()
-                        .expect("managed official account checked"),
-                )
-                .map_err(|e| format!("记录 Codex 托管认证标记失败: {e}"))?;
-                return Ok(());
+            if let Some(account_id) = managed_account_id.as_deref() {
+                // CC Switch owns and refreshes the real OAuth credential.
+                // Codex only receives PROXY_MANAGED through config.toml.
+                // Remove our old synchronization marker while preserving the
+                // native auth.json byte-for-byte for a future restore.
+                crate::codex_config::detach_codex_managed_oauth_live_auth(account_id)
+                    .map_err(|e| format!("解除 Codex 双向凭据同步失败: {e}"))?;
             }
             let live_config = if official_passthrough {
                 prepared_config
@@ -3713,6 +3714,14 @@ impl ProxyService {
                     &prepared_config,
                 )
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
+                let injected = if managed_official {
+                    crate::codex_config::align_codex_requires_openai_auth_with_login_preservation(
+                        &injected, false,
+                    )
+                    .map_err(|e| format!("禁用 Codex 原生 OAuth 刷新失败: {e}"))?
+                } else {
+                    injected
+                };
                 // Takeover never touches auth.json, but it no longer owns the
                 // file's presence: a preservation-off direct switch deletes
                 // the login before takeover is enabled, and `codex logout`
@@ -3730,7 +3739,7 @@ impl ProxyService {
                 // because the official login is never their credential, and
                 // a login on disk must not raise it back to `true`.
                 let proxy_injected_oauth =
-                    provider.is_some_and(Provider::uses_proxy_injected_oauth);
+                    managed_official || provider.is_some_and(Provider::uses_proxy_injected_oauth);
                 let live_login_state = if proxy_injected_oauth {
                     None
                 } else {
@@ -4817,7 +4826,8 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn update_config_reprojection_waits_for_codex_switch_lock_before_rebuilding_live_auth() {
+    async fn update_config_reprojection_waits_for_codex_switch_lock_before_rebuilding_managed_route(
+    ) {
         use tokio::time::{sleep, timeout, Duration};
 
         let _home = TempHome::new();
@@ -4878,8 +4888,16 @@ mod tests {
             .sync_codex_live_from_provider_while_proxy_active(&provider)
             .await
             .expect("seed managed Codex takeover Live config");
-        assert!(crate::codex_config::get_codex_auth_path().exists());
-        assert!(crate::codex_config::codex_managed_oauth_live_auth_marker_exists());
+        assert!(
+            !crate::codex_config::get_codex_auth_path().exists(),
+            "managed takeover must keep the real OAuth bundle out of auth.json"
+        );
+        assert!(!crate::codex_config::codex_managed_oauth_live_auth_marker_exists());
+        let initial_live_config =
+            std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+                .expect("read managed takeover config");
+        assert!(initial_live_config.contains("experimental_bearer_token = \"PROXY_MANAGED\""));
+        assert!(initial_live_config.contains("requires_openai_auth = false"));
 
         let port_reservation =
             std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve replacement port");
@@ -4922,12 +4940,12 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
         assert!(
             !update_task.is_finished(),
-            "update_config must wait for the Codex switch lock before re-projecting Live auth"
+            "update_config must wait for the Codex switch lock before re-projecting the managed route"
         );
 
-        // Perform the credential-removal critical section while owning the same
-        // lock. Once released, update_config must rebuild from current manager
-        // state instead of a credential bundle prepared before removal.
+        // Remove the managed credential while owning the same lock. Once
+        // released, update_config must not recreate a route from stale manager
+        // state prepared before removal.
         state
             .codex_oauth_manager
             .remove_account("acct-managed")
@@ -5327,7 +5345,7 @@ wire_api = "responses"
 
     #[tokio::test]
     #[serial]
-    async fn codex_takeover_hot_switch_adopts_and_clears_outgoing_managed_auth() {
+    async fn codex_takeover_hot_switch_preserves_unowned_live_auth() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
         crate::settings::update_settings(crate::settings::AppSettings::default())
@@ -5409,9 +5427,14 @@ wire_api = "responses"
             .await
             .expect("hot switch managed official to third party");
 
-        assert!(
-            !crate::codex_config::get_codex_auth_path().exists(),
-            "managed auth must not remain live after takeover hot-switch"
+        let preserved_auth: Value =
+            crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
+                .expect("unowned live auth must be preserved");
+        assert_eq!(
+            preserved_auth
+                .pointer("/tokens/refresh_token")
+                .and_then(Value::as_str),
+            Some("cli-refresh-r1")
         );
         assert!(!crate::codex_config::codex_managed_oauth_live_auth_marker_exists());
         assert_eq!(
@@ -5420,7 +5443,7 @@ wire_api = "responses"
                 .test_refresh_token_for_account("acct-managed")
                 .await
                 .as_deref(),
-            Some("cli-refresh-r1")
+            Some("test-refresh-token")
         );
         let backup = db
             .get_live_backup("codex")
@@ -5439,7 +5462,7 @@ wire_api = "responses"
 
     #[tokio::test]
     #[serial]
-    async fn codex_active_takeover_hot_switches_between_managed_accounts() {
+    async fn codex_active_takeover_hot_switches_managed_accounts_without_syncing_auth_json() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
         crate::settings::update_settings(crate::settings::AppSettings::default())
@@ -5520,7 +5543,11 @@ wire_api = "responses"
                 "2099-02-01T00:00:00Z",
             ),
         )
-        .expect("simulate account A CLI refresh during takeover");
+        .expect("seed an unrelated dormant native auth file during takeover");
+        assert!(
+            !crate::codex_config::codex_managed_oauth_live_auth_marker_exists(),
+            "managed takeover must not claim the dormant auth file"
+        );
 
         service
             .hot_switch_provider("codex", &managed_b.id)
@@ -5533,32 +5560,33 @@ wire_api = "responses"
                 .test_refresh_token_for_account("acct-managed-a")
                 .await
                 .as_deref(),
-            Some("cli-refresh-a1"),
-            "A's CLI-rotated refresh token must be adopted before B overwrites live auth"
+            Some("test-refresh-token"),
+            "CC Switch must not adopt a token from detached auth.json"
         );
         let live_auth: Value =
             crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
-                .expect("read managed B live auth");
+                .expect("read preserved dormant auth");
         assert_eq!(
             live_auth
                 .pointer("/tokens/account_id")
                 .and_then(Value::as_str),
-            Some("acct-managed-b")
+            Some("acct-managed-a")
         );
         assert_eq!(
             live_auth
                 .pointer("/tokens/access_token")
                 .and_then(Value::as_str),
-            Some("managed-access-b")
+            Some("cli-access-a1")
         );
         assert!(
-            crate::codex_config::codex_auth_matches_recorded_managed_oauth(
-                &live_auth,
-                "acct-managed-b"
-            )
-            .expect("check managed B marker"),
-            "the live ownership marker must move to account B"
+            !crate::codex_config::codex_managed_oauth_live_auth_marker_exists(),
+            "switching managed accounts must not reattach auth.json synchronization"
         );
+        let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read managed B route");
+        assert!(live_config.contains("experimental_bearer_token = \"PROXY_MANAGED\""));
+        assert!(live_config.contains("requires_openai_auth = false"));
+        assert!(!live_config.contains("managed-access-b"));
 
         let backup = db
             .get_live_backup("codex")
@@ -6457,6 +6485,61 @@ experimental_bearer_token = "PROXY_MANAGED"
 
     #[test]
     #[serial]
+    fn codex_takeover_cleanup_removes_complete_managed_official_route() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let dormant_native_auth = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "native-access",
+                "refresh_token": "native-refresh"
+            }
+        });
+        let projected = crate::codex_config::apply_codex_official_proxy_route(
+            "model = \"gpt-5.4\"\n",
+            "http://127.0.0.1:15721/v1",
+        )
+        .expect("project official route");
+        let projected = crate::codex_config::prepare_codex_provider_live_config(
+            &json!({ "OPENAI_API_KEY": PROXY_TOKEN_PLACEHOLDER }),
+            &projected,
+        )
+        .expect("inject placeholder");
+        let managed =
+            crate::codex_config::align_codex_requires_openai_auth_with_login_preservation(
+                &projected, false,
+            )
+            .expect("disable native oauth");
+        crate::codex_config::write_codex_live_atomic(&dormant_native_auth, Some(&managed))
+            .expect("seed managed takeover");
+
+        assert!(service.detect_takeover_in_live_config_for_app(&AppType::Codex));
+        service
+            .cleanup_codex_takeover_placeholders_in_live()
+            .expect("cleanup managed official route");
+
+        let auth_after: Value =
+            crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
+                .expect("read dormant auth");
+        assert_eq!(auth_after, dormant_native_auth);
+        let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read cleaned config");
+        let parsed: toml::Value = toml::from_str(&live_config).expect("parse cleaned config");
+        assert_eq!(
+            parsed.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5.4")
+        );
+        assert!(parsed.get("model_provider").is_none());
+        assert!(parsed.get("model_providers").is_none());
+        assert!(!live_config.contains(PROXY_TOKEN_PLACEHOLDER));
+        assert!(!live_config.contains("cc-switch-managed-official-proxy"));
+    }
+
+    #[test]
+    #[serial]
     fn codex_takeover_stamps_requires_openai_auth_false_when_auth_json_absent() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
@@ -7261,13 +7344,51 @@ wire_api = "chat"
         )
         .expect("apply official proxy config");
         let parsed: toml::Value = toml::from_str(&output).expect("valid official route");
-        let route_id = crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID;
+        let route_id = crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID;
         let route = &parsed["model_providers"][route_id];
 
         assert_eq!(parsed["model_provider"].as_str(), Some(route_id));
         assert_eq!(route["base_url"].as_str(), Some(proxy_url));
         assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
         assert!(parsed.get("experimental_bearer_token").is_none());
+    }
+
+    #[test]
+    fn apply_codex_proxy_toml_config_keeps_managed_official_in_shared_history_bucket() {
+        let mut provider = Provider::with_id(
+            "codex-official".to_string(),
+            "OpenAI Official".to_string(),
+            json!({ "auth": {}, "config": "" }),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        provider.meta = Some(ProviderMeta {
+            auth_binding: Some(AuthBinding {
+                source: AuthBindingSource::ManagedAccount,
+                auth_provider: Some("codex_oauth".to_string()),
+                account_id: Some("managed-account".to_string()),
+            }),
+            ..Default::default()
+        });
+
+        let output = ProxyService::apply_codex_proxy_toml_config_for_provider(
+            "model = \"gpt-5.6\"\n",
+            "http://127.0.0.1:5000/v1",
+            Some(&provider),
+        )
+        .expect("apply managed official proxy config");
+        let parsed: toml::Value = toml::from_str(&output).expect("valid official route");
+
+        assert_eq!(
+            parsed.get("model_provider").and_then(toml::Value::as_str),
+            Some(crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
+        );
+        assert!(parsed["model_providers"]
+            .get(crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
+            .is_some());
+        assert!(parsed["model_providers"]
+            .get(crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+            .is_none());
     }
 
     #[test]
@@ -8150,7 +8271,7 @@ base_url = "https://codex.example/v1"
 
     #[tokio::test]
     #[serial]
-    async fn codex_takeover_switch_to_managed_official_replaces_native_account() {
+    async fn codex_takeover_switch_to_managed_official_preserves_native_account() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
 
@@ -8210,22 +8331,27 @@ base_url = "https://codex.example/v1"
             live_auth
                 .pointer("/tokens/account_id")
                 .and_then(Value::as_str),
-            Some("acct-managed")
+            Some("acct-native")
         );
         assert_eq!(
             live_auth
                 .pointer("/tokens/access_token")
                 .and_then(Value::as_str),
-            Some("managed-access")
+            Some("native-access")
         );
         assert!(
-            crate::codex_config::codex_auth_matches_recorded_managed_oauth(
+            !crate::codex_config::codex_auth_matches_recorded_managed_oauth(
                 &live_auth,
                 "acct-managed"
             )
             .expect("read managed marker"),
-            "takeover write must record ownership of the managed auth"
+            "proxy-owned OAuth must not bind Codex's native auth file"
         );
+
+        let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read proxied config");
+        assert!(live_config.contains("experimental_bearer_token = \"PROXY_MANAGED\""));
+        assert!(live_config.contains("requires_openai_auth = false"));
     }
 
     #[tokio::test]

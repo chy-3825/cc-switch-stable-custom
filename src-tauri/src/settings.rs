@@ -323,11 +323,22 @@ pub struct CodexProviderTemplateMigration {
     pub migrated_provider_ids: Vec<String>,
 }
 
+// Version 3 also absorbs the older `cc-switch` provider bucket. That bucket
+// was used by the legacy config normalizer and can otherwise hide history
+// after switching back to the official login.
+pub const CODEX_OFFICIAL_HISTORY_UNIFY_MIGRATION_VERSION: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexOfficialHistoryUnifyMigration {
     pub completed_at: String,
     pub target_provider_id: String,
+    /// Version 2 migrated sessions created while the old
+    /// `cc-switch-official` proxy route was active. Version 3 additionally
+    /// migrates the older `cc-switch` bucket. Missing values are legacy
+    /// markers and must not suppress corrective migration.
+    #[serde(default)]
+    pub migration_version: u32,
     #[serde(default)]
     pub migrated_jsonl_files: usize,
     #[serde(default)]
@@ -853,7 +864,10 @@ pub fn is_codex_official_history_unify_migrated_for_dir(codex_dir: &str) -> bool
         .local_migrations
         .as_ref()
         .and_then(|migrations| migrations.codex_official_history_unify_v1.as_ref())
-        .is_some_and(|migration| migration.codex_config_dir.as_deref() == Some(codex_dir))
+        .is_some_and(|migration| {
+            migration.migration_version >= CODEX_OFFICIAL_HISTORY_UNIFY_MIGRATION_VERSION
+                && migration.codex_config_dir.as_deref() == Some(codex_dir)
+        })
 }
 
 /// 条件写入迁移完成标记：仅当此刻开关仍开启且迁移意愿仍在时才写。

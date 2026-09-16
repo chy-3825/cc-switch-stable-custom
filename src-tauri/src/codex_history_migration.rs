@@ -4,7 +4,8 @@
 //! 失败时不写标记，下一次启动自动重试。
 
 use crate::codex_config::{
-    get_codex_config_dir, read_codex_config_text, CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+    get_codex_config_dir, read_codex_config_text, write_codex_live_config_atomic,
+    CC_SWITCH_CODEX_MODEL_PROVIDER_ID, CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
 };
 use crate::codex_state_db::codex_state_db_paths;
 use crate::config::{atomic_write, copy_file, get_app_config_dir};
@@ -45,10 +46,15 @@ fn lock_codex_official_history_op() -> std::sync::MutexGuard<'static, ()> {
 /// 官方订阅（ChatGPT OAuth / OpenAI API key）的历史会话都记录这个 id。
 const OFFICIAL_OPENAI_CODEX_MODEL_PROVIDER_ID: &str = "openai";
 const LEGACY_CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "ccswitch";
+/// Older Codex normalization used `cc-switch` as the internal provider id.
+/// It is still present in live configs and state DBs created by those builds;
+/// leaving it out makes official-login history appear to disappear again.
+const LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID: &str = "cc-switch";
 // If a Codex preset ever used a temporary routing key, keep that old key here
 // so local history can be bucketed under the current custom provider id.
 const CC_SWITCH_LEGACY_CODEX_MODEL_PROVIDER_IDS: &[&str] = &[
     LEGACY_CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+    LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID,
     "aicodemirror",
     "aicoding",
     "aigocode",
@@ -220,21 +226,45 @@ pub fn maybe_migrate_codex_official_history_to_unified_bucket(
             ..Default::default()
         });
     }
-    // live 必须已实际路由到共享 custom 桶才允许迁移：官方配置的注入可能被拒
+    // live 必须已实际路由到共享 custom 桶，或是能无损改写为 custom 的旧
+    // `cc-switch` 路由，才允许迁移：官方配置的注入可能被拒
     // （已有显式 model_provider / 形态冲突的 custom 表，见
     // `inject_codex_unified_session_bucket`），代理接管期间的 live 也不带统一
     // 路由（注入只进备份）。这些状态下新会话仍落 "openai" 桶，迁移只会把
     // 历史搬进当前 live 看不见的桶里。开关与迁移意愿保持不动，待 live 真正
     // 统一后（下次切换 / 接管释放后的启动重试）再迁。
-    if !codex_config_text_routes_custom(&read_codex_config_text().unwrap_or_default()) {
+    let initial_live_config = read_codex_config_text().unwrap_or_default();
+    let legacy_live_rewrite = if codex_config_text_routes_legacy_shared(&initial_live_config) {
+        match rewrite_legacy_shared_live_route_to_custom(&initial_live_config)? {
+            Some(rewritten) => Some(rewritten),
+            None => {
+                return Ok(CodexHistoryProviderBucketMigrationOutcome {
+                    skipped_reason: Some("live_legacy_route_conflict".to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+    } else {
+        None
+    };
+    if !codex_config_text_routes_custom(&initial_live_config) && legacy_live_rewrite.is_none() {
         return Ok(CodexHistoryProviderBucketMigrationOutcome {
             skipped_reason: Some("live_not_unified".to_string()),
             ..Default::default()
         });
     }
 
-    let source_provider_ids: BTreeSet<String> =
-        std::iter::once(OFFICIAL_OPENAI_CODEX_MODEL_PROVIDER_ID.to_string()).collect();
+    let source_provider_ids: BTreeSet<String> = [
+        OFFICIAL_OPENAI_CODEX_MODEL_PROVIDER_ID,
+        // v1 routed official proxy sessions through a separate provider id,
+        // which is the second half of the history split being repaired here.
+        CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
+        // Older cc-switch builds used this internal id for the same route.
+        LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
     let backup_root = migration_backup_root(OFFICIAL_UNIFY_MIGRATION_NAME);
     let migrated_jsonl_files =
         migrate_codex_jsonl_files(&codex_dir, &source_provider_ids, &backup_root)?;
@@ -242,6 +272,27 @@ pub fn maybe_migrate_codex_official_history_to_unified_bucket(
         migrate_codex_state_dbs(&codex_dir, &source_provider_ids, &backup_root)?;
     // 备份代际记录来源目录，restore 据此只取当前目录的账本。
     write_backup_generation_meta(&backup_root, &codex_dir_key)?;
+
+    // Older builds could leave the live selector on `cc-switch`. Migrate the
+    // history first, then atomically move that selector/table to `custom`, and
+    // only then write the completion marker. Compare with the exact text read
+    // above so a concurrent Codex/CC Switch config edit is never overwritten.
+    // A concurrent writer that already moved to `custom` is also acceptable;
+    // any other change leaves the marker unset and the idempotent migration
+    // retries next time.
+    if let Some(rewritten) = legacy_live_rewrite.as_deref() {
+        let current_live_config = read_codex_config_text().unwrap_or_default();
+        if current_live_config == initial_live_config {
+            write_codex_live_config_atomic(Some(rewritten))?;
+        } else if !codex_config_text_routes_custom(&current_live_config) {
+            return Ok(CodexHistoryProviderBucketMigrationOutcome {
+                source_provider_ids: source_provider_ids.iter().cloned().collect(),
+                migrated_jsonl_files,
+                migrated_state_rows,
+                skipped_reason: Some("live_changed_during_migration".to_string()),
+            });
+        }
+    }
 
     let outcome = CodexHistoryProviderBucketMigrationOutcome {
         source_provider_ids: source_provider_ids.into_iter().collect(),
@@ -257,6 +308,7 @@ pub fn maybe_migrate_codex_official_history_to_unified_bucket(
         CodexOfficialHistoryUnifyMigration {
             completed_at: Utc::now().to_rfc3339(),
             target_provider_id: CC_SWITCH_CODEX_MODEL_PROVIDER_ID.to_string(),
+            migration_version: crate::settings::CODEX_OFFICIAL_HISTORY_UNIFY_MIGRATION_VERSION,
             migrated_jsonl_files,
             migrated_state_rows,
             codex_config_dir: Some(codex_dir_key),
@@ -284,6 +336,63 @@ fn codex_config_text_routes_custom(config_text: &str) -> bool {
                 .map(|id| id.trim() == CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
         })
         .unwrap_or(false)
+}
+
+fn codex_config_text_routes_legacy_shared(config_text: &str) -> bool {
+    config_text
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|doc| {
+            doc.get("model_provider")
+                .and_then(|item| item.as_str())
+                .map(|id| id.trim() == LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID)
+        })
+        .unwrap_or(false)
+}
+
+/// Rewrite the cc-switch-owned legacy live route without overwriting an
+/// existing `custom` table. `None` means the old selector cannot be mapped
+/// safely (missing source table or a conflicting destination table).
+fn rewrite_legacy_shared_live_route_to_custom(
+    config_text: &str,
+) -> Result<Option<String>, AppError> {
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    if doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        != Some(LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID)
+    {
+        return Ok(None);
+    }
+
+    let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    else {
+        return Ok(None);
+    };
+
+    let legacy_exists = providers
+        .get(LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID)
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some();
+    let custom_exists = providers
+        .get(CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some();
+    if !legacy_exists || custom_exists {
+        return Ok(None);
+    }
+
+    let legacy = providers
+        .remove(LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID)
+        .expect("legacy provider existence checked");
+    providers.insert(CC_SWITCH_CODEX_MODEL_PROVIDER_ID, legacy);
+    doc["model_provider"] = toml_edit::value(CC_SWITCH_CODEX_MODEL_PROVIDER_ID);
+    Ok(Some(doc.to_string()))
 }
 
 /// 目录的规范化字符串形式，用作 marker / 备份代际的目录身份。
@@ -1326,6 +1435,14 @@ supports_websockets = true
 wire_api = "responses"
 "#
         ));
+        // A legacy route is eligible only through the explicit rewrite path;
+        // it must never be mistaken for already-unified live state.
+        assert!(!codex_config_text_routes_custom(
+            "model_provider = \"cc-switch\"\n"
+        ));
+        assert!(codex_config_text_routes_legacy_shared(
+            "model_provider = \"cc-switch\"\n"
+        ));
         // 第三方供应商的常规 custom 路由（带 base_url）同样算已统一
         assert!(codex_config_text_routes_custom(
             r#"model_provider = "custom"
@@ -1344,6 +1461,49 @@ base_url = "https://aihubmix.example/v1"
         ));
         assert!(!codex_config_text_routes_custom(""));
         assert!(!codex_config_text_routes_custom("not toml ["));
+    }
+
+    #[test]
+    fn rewrites_legacy_live_route_and_provider_table_to_custom() {
+        let legacy = r#"model_provider = "cc-switch"
+model = "deepseek-v4-flash"
+
+[model_providers.cc-switch]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+wire_api = "responses"
+"#;
+        let rewritten = rewrite_legacy_shared_live_route_to_custom(legacy)
+            .expect("rewrite")
+            .expect("safe rewrite");
+        let doc: toml::Value = toml::from_str(&rewritten).expect("parse rewritten config");
+        assert_eq!(
+            doc.get("model_provider").and_then(toml::Value::as_str),
+            Some(CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
+        );
+        assert!(doc["model_providers"]
+            .get(CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
+            .is_some());
+        assert!(doc["model_providers"]
+            .get(LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID)
+            .is_none());
+        assert!(codex_config_text_routes_custom(&rewritten));
+    }
+
+    #[test]
+    fn legacy_live_route_rewrite_refuses_to_overwrite_custom_table() {
+        let conflict = r#"model_provider = "cc-switch"
+
+[model_providers.cc-switch]
+name = "Legacy"
+
+[model_providers.custom]
+name = "User Provider"
+base_url = "https://user.example/v1"
+"#;
+        assert!(rewrite_legacy_shared_live_route_to_custom(conflict)
+            .expect("inspect conflict")
+            .is_none());
     }
 
     fn migrate_provider_templates_for_test(

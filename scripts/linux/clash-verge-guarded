@@ -1,0 +1,190 @@
+#!/bin/bash
+set -u
+
+service="${CLASH_GUARD_SERVICE:-clash-verge-service.service}"
+runtime_dir="${CLASH_GUARD_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}"
+lease_dir="$runtime_dir/clash-verge-ui-leases"
+lease="$lease_dir/$$"
+launcher_path="${CLASH_GUARD_LAUNCHER_PATH:-/usr/local/bin/clash-verge-guarded}"
+clash_binary="${CLASH_GUARD_BINARY:-/usr/bin/clash-verge}"
+clash_ui_exe="${CLASH_GUARD_UI_EXE:-/usr/bin/clash-verge}"
+sudo_command="${CLASH_GUARD_SUDO:-sudo}"
+systemctl_command="${CLASH_GUARD_SYSTEMCTL:-systemctl}"
+gsettings_command="${CLASH_GUARD_GSETTINGS:-gsettings}"
+xdg_mime_command="${CLASH_GUARD_XDG_MIME:-xdg-mime}"
+applications_dir="${CLASH_GUARD_APPLICATIONS_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/applications}"
+protocol_handler="$applications_dir/clash-verge-handler.desktop"
+protocol_repair_attempts="${CLASH_GUARD_PROTOCOL_REPAIR_ATTEMPTS:-40}"
+protocol_repair_interval="${CLASH_GUARD_PROTOCOL_REPAIR_INTERVAL:-0.05}"
+clash_child=""
+
+process_start_ticks() {
+  local pid="$1"
+  awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true
+}
+
+lease_is_live() {
+  local marker="$1" pid expected actual cmdline
+  pid="${marker##*/}"
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ -r "/proc/$pid/stat" ] || return 1
+  expected="$(sed -n '1p' "$marker" 2>/dev/null || true)"
+  actual="$(process_start_ticks "$pid")"
+  [ -n "$expected" ] && [ "$expected" = "$actual" ] || return 1
+  cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  case "$cmdline" in
+    *"$launcher_path"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+prune_leases() {
+  local marker
+  [ -d "$lease_dir" ] || return 0
+  for marker in "$lease_dir"/*; do
+    [ -f "$marker" ] || continue
+    if ! lease_is_live "$marker"; then
+      unlink "$marker" 2>/dev/null || true
+    fi
+  done
+  rmdir "$lease_dir" 2>/dev/null || true
+}
+
+has_live_lease() {
+  local marker
+  [ -d "$lease_dir" ] || return 1
+  for marker in "$lease_dir"/*; do
+    [ -f "$marker" ] || continue
+    if lease_is_live "$marker"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+has_running_clash_ui() {
+  local proc exe
+  for proc in /proc/[0-9]*; do
+    [ -d "$proc" ] || continue
+    exe="$(readlink -f "$proc/exe" 2>/dev/null || true)"
+    if [ "$exe" = "$clash_ui_exe" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+protocol_handler_is_guarded() {
+  [ -f "$protocol_handler" ] \
+    && grep -Fqx "Exec=$launcher_path %u" "$protocol_handler" \
+    && grep -Fq 'x-scheme-handler/clash-verge' "$protocol_handler" \
+    && grep -Fq 'x-scheme-handler/clash' "$protocol_handler"
+}
+
+repair_protocol_handler() {
+  local temporary_handler
+  protocol_handler_is_guarded && return 0
+
+  mkdir -p "$applications_dir" || return 1
+  temporary_handler="$protocol_handler.guard.$$"
+  if ! printf '%s\n' \
+    '[Desktop Entry]' \
+    'Type=Application' \
+    'Name=Clash Verge' \
+    'Terminal=false' \
+    'NoDisplay=true' \
+    'MimeType=x-scheme-handler/clash-verge;x-scheme-handler/clash;' \
+    "Exec=$launcher_path %u" > "$temporary_handler"; then
+    return 1
+  fi
+  chmod 0644 "$temporary_handler" 2>/dev/null || true
+  if ! mv -f "$temporary_handler" "$protocol_handler"; then
+    unlink "$temporary_handler" 2>/dev/null || true
+    return 1
+  fi
+
+  if command -v "$xdg_mime_command" >/dev/null 2>&1; then
+    "$xdg_mime_command" default clash-verge-handler.desktop x-scheme-handler/clash-verge >/dev/null 2>&1 || true
+    "$xdg_mime_command" default clash-verge-handler.desktop x-scheme-handler/clash >/dev/null 2>&1 || true
+  fi
+}
+
+repair_protocol_handler_after_start() {
+  local attempt=0
+  # tauri-plugin-deep-link rewrites this file to current_exe during startup.
+  # Poll briefly after spawning Clash so the guarded route wins that race and
+  # every later clash:// / clash-verge:// launch comes back through this owner.
+  while [ "$attempt" -lt "$protocol_repair_attempts" ]; do
+    attempt=$((attempt + 1))
+    sleep "$protocol_repair_interval"
+    repair_protocol_handler || true
+    if [ -n "$clash_child" ] && ! kill -0 "$clash_child" 2>/dev/null; then
+      break
+    fi
+  done
+}
+
+cleanup() {
+  trap - EXIT HUP INT TERM
+  unlink "$lease" 2>/dev/null || true
+  prune_leases
+
+  # Only the last guarded UI owner performs global cleanup. Disable the
+  # desktop proxy first so a slow service stop never leaves localhost:7897 as
+  # a black hole; stopping the service then tears down Mihomo/TUN routes.
+  if ! has_live_lease && ! has_running_clash_ui; then
+    "$gsettings_command" set org.gnome.system.proxy mode 'none' >/dev/null 2>&1 || true
+    if ! "$sudo_command" -n "$systemctl_command" stop "$service" >/dev/null 2>&1; then
+      echo "Clash Verge: 无法停止 $service，请检查 sudoers 配置。" >&2
+    fi
+    rmdir "$lease_dir" 2>/dev/null || true
+  fi
+}
+
+forward_to_child() {
+  local signal="$1"
+  if [ -n "$clash_child" ] && kill -0 "$clash_child" 2>/dev/null; then
+    kill -s "$signal" "$clash_child" 2>/dev/null || true
+  fi
+}
+
+wait_for_child_exit() {
+  local pid="$1" status
+  while :; do
+    wait "$pid"
+    status=$?
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return "$status"
+    fi
+  done
+}
+
+trap cleanup EXIT
+trap 'forward_to_child HUP' HUP
+trap 'forward_to_child INT' INT
+trap 'forward_to_child TERM' TERM
+
+prune_leases
+first_ui=true
+if has_live_lease || has_running_clash_ui; then
+  first_ui=false
+fi
+mkdir -p "$lease_dir" || exit 1
+process_start_ticks "$$" > "$lease" || exit 1
+
+# At login, clear a proxy address persisted by the previous session before the
+# core starts. Clash may re-enable it after its listener is ready.
+if [ "$first_ui" = true ]; then
+  "$gsettings_command" set org.gnome.system.proxy mode 'none' >/dev/null 2>&1 || true
+fi
+
+"$sudo_command" -n "$systemctl_command" start "$service" || exit 1
+"$clash_binary" "$@" &
+clash_child=$!
+repair_protocol_handler_after_start
+wait_for_child_exit "$clash_child"
+status=$?
+clash_child=""
+exit "$status"

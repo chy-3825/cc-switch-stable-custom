@@ -765,6 +765,18 @@ pub fn run() {
                 Err(e) => log::warn!("✗ Failed to seed official providers: {e}"),
             }
 
+            // Managed Codex OAuth has one credential owner: the OAuth account
+            // store. Older builds could backfill auth.json into the provider
+            // row, leaving a second stale refresh-token copy. Scrub it before
+            // any provider can be switched or projected to live config.
+            match app_state.db.scrub_managed_codex_provider_auth_snapshots() {
+                Ok(count) if count > 0 => {
+                    log::info!("✓ Scrubbed OAuth snapshots from {count} managed Codex provider(s)");
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("✗ Failed to scrub managed Codex OAuth snapshots: {e}"),
+            }
+
             {
                 let db_for_codex_history_migration = app_state.db.clone();
                 tauri::async_runtime::spawn_blocking(move || {
@@ -806,24 +818,6 @@ pub fn run() {
                         }
                     }
 
-                    // 统一会话开关的官方历史迁移：开关开启但上次未完成（如文件被占用
-                    // 中途失败）时在启动期重试；函数内部自门控，开关关闭时直接跳过。
-                    match crate::codex_history_migration::maybe_migrate_codex_official_history_to_unified_bucket() {
-                        Ok(outcome) => {
-                            if let Some(reason) = outcome.skipped_reason {
-                                log::debug!("○ Codex official history unify migration skipped: {reason}");
-                            } else {
-                                log::info!(
-                                    "✓ Codex official history unify migration completed: jsonl_files={}, state_rows={}",
-                                    outcome.migrated_jsonl_files,
-                                    outcome.migrated_state_rows
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("✗ Codex official history unify migration failed: {e}");
-                        }
-                    }
                 });
             }
 
@@ -1241,6 +1235,32 @@ pub fn run() {
 
                 // 检查 settings 表中的代理状态，自动恢复代理服务
                 restore_proxy_state_on_startup(&state).await;
+
+                // 官方代理路由必须先恢复为共享 `custom` 桶，再迁移历史；否则
+                // 旧版 `cc-switch-official` 路由会让迁移错误地判定 live 未统一。
+                let official_history_migration = tauri::async_runtime::spawn_blocking(|| {
+                    crate::codex_history_migration::maybe_migrate_codex_official_history_to_unified_bucket()
+                })
+                .await;
+                match official_history_migration {
+                    Ok(Ok(outcome)) => {
+                        if let Some(reason) = outcome.skipped_reason {
+                            log::debug!("○ Codex official history unify migration skipped: {reason}");
+                        } else {
+                            log::info!(
+                                "✓ Codex official history unify migration completed: jsonl_files={}, state_rows={}",
+                                outcome.migrated_jsonl_files,
+                                outcome.migrated_state_rows
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!("✗ Codex official history unify migration failed: {e}");
+                    }
+                    Err(e) => {
+                        log::warn!("✗ Codex official history unify migration task failed: {e}");
+                    }
+                }
 
                 // Periodic backup check (on startup)
                 if let Err(e) = state.db.periodic_backup_if_needed() {

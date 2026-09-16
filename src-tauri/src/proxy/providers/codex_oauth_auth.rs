@@ -709,17 +709,11 @@ impl CodexOAuthManager {
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
             let refresh_error_code = extract_refresh_error_code(&text);
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-                || matches!(
-                    refresh_error_code.as_deref(),
-                    Some(
-                        "refresh_token_expired"
-                            | "refresh_token_reused"
-                            | "refresh_token_invalidated"
-                    )
-                )
-            {
+            // Only an explicit refresh-token error proves that the account's
+            // credential is invalid. A bare HTTP 401/403 can be emitted by a
+            // proxy, WAF, or transient upstream policy and must remain a
+            // retryable/query failure instead of being shown as "expired".
+            if is_explicit_refresh_token_invalid(refresh_error_code.as_deref()) {
                 return Err(CodexOAuthError::RefreshTokenInvalid);
             }
             return Err(CodexOAuthError::TokenFetchFailed(format!(
@@ -2009,6 +2003,19 @@ fn extract_refresh_error_code(body: &str) -> Option<String> {
         })
         .or_else(|| value.get("code").and_then(|code| code.as_str()))
         .map(|code| code.to_ascii_lowercase())
+}
+
+fn is_explicit_refresh_token_invalid(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "invalid_grant"
+                | "invalid_token"
+                | "refresh_token_expired"
+                | "refresh_token_reused"
+                | "refresh_token_invalidated"
+        )
+    )
 }
 
 /// 解析 JWT 中的 claims
@@ -3332,5 +3339,16 @@ mod tests {
             Some("refresh_token_invalidated")
         );
         assert_eq!(extract_refresh_error_code("not json"), None);
+    }
+
+    #[test]
+    fn bare_http_status_does_not_prove_refresh_token_invalid() {
+        assert!(!is_explicit_refresh_token_invalid(None));
+        assert!(!is_explicit_refresh_token_invalid(Some("rate_limited")));
+        assert!(is_explicit_refresh_token_invalid(Some("invalid_grant")));
+        assert!(is_explicit_refresh_token_invalid(Some("invalid_token")));
+        assert!(is_explicit_refresh_token_invalid(Some(
+            "refresh_token_reused"
+        )));
     }
 }

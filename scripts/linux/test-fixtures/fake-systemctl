@@ -1,0 +1,4 @@
+#!/bin/bash
+set -u
+printf 'systemctl %s\n' "$*" >> "${LAUNCHER_TEST_LOG:?}"
+exit 0

@@ -1,0 +1,16 @@
+#!/bin/bash
+set -u
+exit_file="${FAKE_CLASH_EXIT_FILE:?}"
+if [ -n "${FAKE_CLASH_HANDLER_PATH:-}" ]; then
+  mkdir -p "$(dirname "$FAKE_CLASH_HANDLER_PATH")"
+  printf '%s\n' \
+    '[Desktop Entry]' \
+    'Type=Application' \
+    'Name=Clash Verge' \
+    'MimeType=x-scheme-handler/clash-verge;x-scheme-handler/clash' \
+    'Exec="/usr/bin/clash-verge" %u' > "$FAKE_CLASH_HANDLER_PATH"
+fi
+trap 'exit 0' HUP INT TERM
+while [ ! -e "$exit_file" ]; do
+  sleep 0.05
+done

@@ -1,0 +1,9 @@
+#!/bin/bash
+set -u
+printf 'cc-switch started http_proxy=%s\n' "${http_proxy:-unset}" >> "${LAUNCHER_TEST_LOG:?}"
+trap 'printf "cc-switch signalled\n" >> "${LAUNCHER_TEST_LOG:?}"; exit 0' HUP INT TERM
+if [ -n "${FAKE_CC_EXIT_FILE:-}" ]; then
+  while [ ! -e "$FAKE_CC_EXIT_FILE" ]; do
+    sleep 0.05
+  done
+fi

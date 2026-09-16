@@ -1,0 +1,112 @@
+#!/bin/bash
+# Installed copy: ${HOME}/.local/bin/cc-switch
+#
+# This repository copy is intentionally kept as the auditable source for the
+# workstation launcher. Install it with mode 0755 after adjusting the binary
+# path if the local build location changes.
+set -u
+
+clash_service="${CC_SWITCH_CLASH_SERVICE:-clash-verge-service.service}"
+cc_switch_binary="${CC_SWITCH_BINARY:-${HOME}/.local/bin/cc-switch-fixed-3.20.3}"
+systemctl_command="${CC_SWITCH_SYSTEMCTL:-systemctl}"
+sudo_command="${CC_SWITCH_SUDO:-sudo}"
+clash_wait_attempts="${CC_SWITCH_CLASH_WAIT_ATTEMPTS:-20}"
+cc_switch_existing_window=""
+cc_switch_child=""
+
+clash_port_from_config() {
+  local clash_config="${HOME}/.local/share/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"
+  local clash_port=""
+  if [ -r "$clash_config" ]; then
+    clash_port="$(awk -F: '/^[[:space:]]*mixed-port:[[:space:]]*[0-9]+[[:space:]]*($|#)/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$clash_config")"
+  fi
+  printf '%s\n' "${clash_port:-7897}"
+}
+
+port_is_open() {
+  local port="$1"
+  (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null
+}
+
+prepare_clash_environment() {
+  local clash_port attempt
+  clash_port="${CC_SWITCH_CLASH_PORT:-$(clash_port_from_config)}"
+  if command -v "$systemctl_command" >/dev/null 2>&1 \
+    && "$systemctl_command" cat "$clash_service" >/dev/null 2>&1 \
+    && ! "$systemctl_command" is-active --quiet "$clash_service"; then
+    if ! command -v "$sudo_command" >/dev/null 2>&1 \
+      || ! "$sudo_command" -n "$systemctl_command" start "$clash_service" >/dev/null 2>&1; then
+      echo "CC Switch: Clash Verge 服务尚未就绪，继续启动 CC Switch。" >&2
+    fi
+  fi
+  attempt=0
+  while ! port_is_open "$clash_port"; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge "$clash_wait_attempts" ]; then
+      echo "CC Switch: Clash Verge 核心未监听 127.0.0.1:$clash_port，继续启动 CC Switch。" >&2
+      return 0
+    fi
+    sleep 0.5
+  done
+  export HTTP_PROXY="http://127.0.0.1:$clash_port"
+  export HTTPS_PROXY="http://127.0.0.1:$clash_port"
+  export ALL_PROXY="http://127.0.0.1:$clash_port"
+  export NO_PROXY="localhost,127.0.0.1,::1"
+  export http_proxy="$HTTP_PROXY"
+  export https_proxy="$HTTPS_PROXY"
+  export all_proxy="$ALL_PROXY"
+  export no_proxy="$NO_PROXY"
+}
+
+focus_existing_window() {
+  if [ -z "${DISPLAY:-}" ] || ! command -v xdotool >/dev/null 2>&1; then
+    return 0
+  fi
+  local window_id
+  window_id="$(xdotool search --class '^cc-switch$' 2>/dev/null \
+    | awk '/^[0-9]+$/ { last = $0 } END { print last }')"
+  if [ -n "$window_id" ]; then
+    cc_switch_existing_window="$window_id"
+    xdotool windowmap "$window_id" >/dev/null 2>&1 || true
+    xdotool windowraise "$window_id" >/dev/null 2>&1 || true
+    xdotool windowactivate "$window_id" >/dev/null 2>&1 || true
+  fi
+}
+
+forward_to_child() {
+  local signal="$1"
+  if [ -n "$cc_switch_child" ] && kill -0 "$cc_switch_child" 2>/dev/null; then
+    kill -s "$signal" "$cc_switch_child" 2>/dev/null || true
+  fi
+}
+
+wait_for_child_exit() {
+  local pid="$1" status
+  while :; do
+    wait "$pid"
+    status=$?
+    # A trapped signal interrupts Bash's wait before the child has necessarily
+    # exited. Keep owning/reaping the child instead of orphaning it.
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return "$status"
+    fi
+  done
+}
+
+trap 'forward_to_child HUP' HUP
+trap 'forward_to_child INT' INT
+trap 'forward_to_child TERM' TERM
+
+if [ ! -x "$cc_switch_binary" ]; then
+  echo "CC Switch: 未找到固定版本 $cc_switch_binary，请先安装修复版。" >&2
+  exit 127
+fi
+
+prepare_clash_environment || true
+focus_existing_window
+/bin/bash -c 'exec -a cc-switch "$@"' _ "$cc_switch_binary" "$@" &
+cc_switch_child=$!
+wait_for_child_exit "$cc_switch_child"
+status=$?
+cc_switch_child=""
+exit "$status"
